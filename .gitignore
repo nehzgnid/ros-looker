@@ -1,0 +1,19 @@
+# C++ Build
+cpp_watcher/build/
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
