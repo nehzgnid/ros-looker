@@ -21,8 +21,10 @@
 
 #include <sys/sysinfo.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h> // For setpriority
 #include <dirent.h>
 #include <unistd.h>
+#include <stdlib.h> // for getloadavg
 
 using namespace ftxui;
 
@@ -32,6 +34,7 @@ struct ProcessInfo {
     std::string name;
     float cpu_usage;
     float mem_usage;
+    int nice; // Priority (-20 to 19)
 };
 
 struct SystemState {
@@ -41,6 +44,7 @@ struct SystemState {
     float disk_percent = 0.0f;
     float net_rx_kbps = 0.0f;
     float net_tx_kbps = 0.0f;
+    double load_avg[3] = {0.0, 0.0, 0.0}; // 1, 5, 15 min
     
     std::deque<int> cpu_history;
     std::deque<int> net_rx_history; 
@@ -50,9 +54,11 @@ struct SystemState {
     std::vector<std::string> ros_node_names;
     std::vector<std::string> detected_workspaces;
     
-    // Memory Auto-Free Config
+    // Configs
     int mem_threshold = 85; 
-    std::string last_message = "Ready. Use '[' or ']' to adjust RAM limit, 'm' to free now.";
+    bool turbo_mode_active = false;
+
+    std::string last_message = "Ready. 't': Turbo ROS | '+/-': Renice | 'm': Free Mem";
     bool ros_master_online = false;
     bool is_root = false; 
 };
@@ -76,20 +82,69 @@ std::string exec_command(const char* cmd) {
     return result;
 }
 
-// Improved Memory Free Logic
+// Memory Free
 bool try_free_memory(std::string& out_msg) {
     if (geteuid() != 0) {
-        out_msg = "Error: Root required. Please run with 'sudo'.";
+        out_msg = "Error: Root required.";
         return false;
     }
     int ret = system("sync && echo 3 > /proc/sys/vm/drop_caches");
     if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
-        out_msg = "Success: System cache cleared.";
+        out_msg = "Success: Cache cleared.";
         return true;
     } else {
         out_msg = "Failed: Could not clear cache.";
         return false;
     }
+}
+
+// Priority Management
+bool set_proc_priority(int pid, int new_nice, std::string& out_msg) {
+    if (geteuid() != 0) {
+        out_msg = "Error: Root required to change priority.";
+        return false;
+    }
+    // setpriority expects target, pid, priority
+    if (setpriority(PRIO_PROCESS, pid, new_nice) == 0) {
+        out_msg = "PID " + std::to_string(pid) + " nice set to " + std::to_string(new_nice);
+        return true;
+    }
+    out_msg = "Failed to set priority.";
+    return false;
+}
+
+// Turbo Mode: Boost ROS related processes
+void toggle_turbo_mode(std::string& out_msg) {
+    if (geteuid() != 0) {
+        out_msg = "Error: Root required for Turbo Mode.";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_state.turbo_mode_active = !g_state.turbo_mode_active;
+    
+    if (!g_state.turbo_mode_active) {
+        out_msg = "Turbo Mode: OFF (Priorities reset not implemented yet)";
+        return; 
+    }
+
+    int boosted = 0;
+    // Simple heuristic: Boost anything with "ros", "node", "slam", "nav"
+    // In a real app, this should be more strict.
+    for (const auto& p : g_state.processes) {
+        std::string n = p.name;
+        // Basic keywords common in ROS
+        if (n.find("ros") != std::string::npos || 
+            n.find("node") != std::string::npos ||
+            n.find("slam") != std::string::npos ||
+            n.find("nav") != std::string::npos ||
+            n.find("controller") != std::string::npos) {
+            
+            setpriority(PRIO_PROCESS, p.pid, -10); // High Priority
+            boosted++;
+        }
+    }
+    out_msg = "Turbo Mode: ON! Boosted " + std::to_string(boosted) + " ROS processes.";
 }
 
 float get_cpu_usage() {
@@ -193,16 +248,20 @@ std::vector<ProcessInfo> get_processes() {
         std::istringstream iss(content.substr(r_paren + 2));
         char state; int ppid, pgrp, session, tty, tpgid; unsigned int flags;
         unsigned long minflt, cminflt, majflt, cmajflt, utime, stime;
+        long priority, nice;
         unsigned long rss;
         std::string ignore;
+        
+        // Parse up to nice (index 18/19)
         iss >> state >> ppid >> pgrp >> session >> tty >> tpgid >> flags 
             >> minflt >> cminflt >> majflt >> cmajflt 
-            >> utime >> stime >> ignore >> ignore >> ignore >> ignore >> ignore >> ignore >> ignore >> rss;
+            >> utime >> stime >> ignore >> ignore >> priority >> nice >> ignore >> ignore >> rss;
         
         ProcessInfo p;
         p.pid = pid; p.name = name; 
         p.mem_usage = (float)rss * 4096 / 1024 / 1024; 
-        p.cpu_usage = (float)(utime + stime); 
+        p.cpu_usage = (float)(utime + stime);
+        p.nice = (int)nice;
         
         procs.push_back(p);
     }
@@ -259,6 +318,9 @@ void worker_thread() {
         float net_rx = 0, net_tx = 0;
         update_net_usage(net_rx, net_tx);
         
+        double loads[3];
+        if (getloadavg(loads, 3) == -1) { loads[0]=0; loads[1]=0; loads[2]=0; }
+
         auto procs = get_processes();
         std::vector<std::string> nodes;
         std::vector<std::string> workspaces;
@@ -299,6 +361,9 @@ void worker_thread() {
             g_state.disk_percent = disk;
             g_state.net_rx_kbps = net_rx;
             g_state.net_tx_kbps = net_tx;
+            g_state.load_avg[0] = loads[0];
+            g_state.load_avg[1] = loads[1];
+            g_state.load_avg[2] = loads[2];
             
             g_state.cpu_history.push_back((int)cpu);
             if(g_state.cpu_history.size() > 60) g_state.cpu_history.pop_front();
@@ -326,7 +391,7 @@ int main() {
     std::thread bg_thread(worker_thread);
     auto screen = ScreenInteractive::Fullscreen();
 
-    // 1. Dashboard (Enhanced with values)
+    // 1. Dashboard
     auto dashboard = Renderer([]() -> Element {
         std::lock_guard<std::mutex> lock(g_mutex);
         
@@ -335,24 +400,25 @@ int main() {
 
         Elements left_elems;
         left_elems.push_back(text("System Resources") | bold | underlined);
+        
+        // Load Avg
+        std::stringstream load_ss; load_ss << std::fixed << std::setprecision(2) << g_state.load_avg[0] << ", " << g_state.load_avg[1] << ", " << g_state.load_avg[2];
+        left_elems.push_back(hbox(text("Load Avg: "), text(load_ss.str()) | color(Color::Yellow)));
+
         left_elems.push_back(text(""));
         
         // CPU
         left_elems.push_back(hbox(text("CPU Usage: "), text(std::to_string((int)g_state.cpu_percent) + "%") | bold | color(Color::Cyan)));
         left_elems.push_back(gauge(g_state.cpu_percent / 100.0) | color(Color::Cyan));
         
-        // Memory with Configurable Threshold
+        // Memory
         std::string mem_val = std::to_string((int)g_state.mem_percent) + "%";
         std::string thresh_val = std::to_string(g_state.mem_threshold) + "%";
-        
         left_elems.push_back(text(""));
         left_elems.push_back(hbox(
             text("RAM Usage: "), text(mem_val) | bold | color(Color::Magenta),
             text("  [Limit: "), text(thresh_val) | bold | color(Color::Yellow), text("]")
         ));
-        if (!g_state.is_root) {
-            left_elems.push_back(text("  (Note: Run with sudo to enable auto-free)") | color(Color::GrayDark) | dim);
-        }
         left_elems.push_back(gauge(g_state.mem_percent / 100.0) | color(g_state.mem_percent > g_state.mem_threshold ? Color::Red : Color::Magenta));
         
         // Disk
@@ -368,6 +434,11 @@ int main() {
             ? text(" ONLINE ") | bgcolor(Color::Green) | bold 
             : text(" OFFLINE ") | bgcolor(Color::Red) | bold;
         left_elems.push_back(hbox(text("ROS Master: "), ros_status));
+        
+        if (g_state.turbo_mode_active) {
+            left_elems.push_back(text(""));
+            left_elems.push_back(text("🚀 TURBO MODE ACTIVE") | bold | blink | color(Color::Red));
+        }
 
         Elements right_elems;
         right_elems.push_back(text("CPU Load History (60s)") | center);
@@ -408,7 +479,7 @@ int main() {
         return window(text(" Network Traffic "), vbox(hbox(std::move(header)) | center, net_rx_graph | flex));
     });
 
-    // 3. Process Manager
+    // 3. Process Manager (Smart Scheduler Edition)
     int selected_proc_idx = 0;
     int proc_scroll_start = 0;
     const int VISIBLE_PROC_ROWS = 15;
@@ -418,24 +489,32 @@ int main() {
         lines.push_back(hbox(
             text("PID") | size(WIDTH, EQUAL, 8),
             text("NAME") | size(WIDTH, EQUAL, 20),
-            text("CPU") | size(WIDTH, EQUAL, 10),
-            text("MEM(MB)") | size(WIDTH, EQUAL, 10)
+            text("CPU") | size(WIDTH, EQUAL, 8),
+            text("MEM(MB)") | size(WIDTH, EQUAL, 8),
+            text("NI") | size(WIDTH, EQUAL, 4)
         ) | bold | underlined);
+        
         int total = g_state.processes.size();
         int end = std::min(total, proc_scroll_start + VISIBLE_PROC_ROWS);
         for (int i = proc_scroll_start; i < end; ++i) {
             const auto& p = g_state.processes[i];
             bool sel = (i == selected_proc_idx);
+            
+            Color nice_color = Color::White;
+            if (p.nice < 0) nice_color = Color::Red; // High Prio
+            if (p.nice > 0) nice_color = Color::Green; // Low Prio
+
             auto row = hbox(
                 text(std::to_string(p.pid)) | size(WIDTH, EQUAL, 8),
                 text(p.name) | size(WIDTH, EQUAL, 20),
-                text(std::to_string((int)p.cpu_usage)) | size(WIDTH, EQUAL, 10),
-                text(std::to_string((int)p.mem_usage)) | size(WIDTH, EQUAL, 10)
+                text(std::to_string((int)p.cpu_usage)) | size(WIDTH, EQUAL, 8),
+                text(std::to_string((int)p.mem_usage)) | size(WIDTH, EQUAL, 8),
+                text(std::to_string(p.nice)) | size(WIDTH, EQUAL, 4) | color(nice_color)
             );
             if (sel) row = row | inverted;
             lines.push_back(row);
         }
-        return window(text(" Processes "), vbox(std::move(lines)) | flex);
+        return window(text(" Processes (Press +/- to Renice) "), vbox(std::move(lines)) | flex);
     });
 
     // 4. ROS Manager
@@ -470,7 +549,7 @@ int main() {
 
     auto main_container = Container::Vertical({
         Container::Horizontal({
-            Renderer([&]{ return text(" ROS-Edge-Commander v0.6 ") | bold | color(Color::Cyan) | center; }),
+            Renderer([&]{ return text(" ROS-Edge-Commander v0.7 ") | bold | color(Color::Cyan) | center; }),
             tab_menu,
             Renderer([&]{ return text(" | 'q' quit ") | color(Color::GrayDark); })
         }) | border,
@@ -482,8 +561,15 @@ int main() {
 
     main_renderer = CatchEvent(main_renderer, [&](Event event) {
         if (event == Event::Character('q')) { screen.ExitLoopClosure()(); return true; }
+        
+        // Global Actions
         if (event == Event::Character('m')) {
             std::string msg; try_free_memory(msg);
+            std::lock_guard<std::mutex> lock(g_mutex); g_state.last_message = msg;
+            return true;
+        }
+        if (event == Event::Character('t')) {
+            std::string msg; toggle_turbo_mode(msg);
             std::lock_guard<std::mutex> lock(g_mutex); g_state.last_message = msg;
             return true;
         }
@@ -499,18 +585,53 @@ int main() {
             g_state.last_message = "Limit set to " + std::to_string(g_state.mem_threshold) + "%";
             return true;
         }
+
+        // Process Renice Logic
         if (tab_index == 2) { 
              std::lock_guard<std::mutex> lock(g_mutex);
              int total = g_state.processes.size();
-             if (event == Event::ArrowUp && selected_proc_idx > 0) { selected_proc_idx--; if(selected_proc_idx < proc_scroll_start) proc_scroll_start--; }
-             if (event == Event::ArrowDown && selected_proc_idx < total-1) { selected_proc_idx++; if(selected_proc_idx >= proc_scroll_start + VISIBLE_PROC_ROWS) proc_scroll_start++; }
-             if (event == Event::Character('k') && !g_state.processes.empty()) { kill(g_state.processes[selected_proc_idx].pid, SIGTERM); g_state.last_message = "Killed PID"; }
+             int max_idx = std::max(0, total - 1);
+             
+             if (event == Event::ArrowUp && selected_proc_idx > 0) { 
+                 selected_proc_idx--; if(selected_proc_idx < proc_scroll_start) proc_scroll_start--; 
+             }
+             if (event == Event::ArrowDown && selected_proc_idx < max_idx) { 
+                 selected_proc_idx++; if(selected_proc_idx >= proc_scroll_start + VISIBLE_PROC_ROWS) proc_scroll_start++; 
+             }
+             
+             // Renice
+             if (event == Event::Character('-') || event == Event::Character('_')) { // Boost (Lower Nice)
+                 if (selected_proc_idx < total) {
+                     std::string msg;
+                     int new_nice = g_state.processes[selected_proc_idx].nice - 1;
+                     if (new_nice < -20) new_nice = -20;
+                     if(set_proc_priority(g_state.processes[selected_proc_idx].pid, new_nice, msg))
+                        g_state.processes[selected_proc_idx].nice = new_nice; // Optimistic update
+                     g_state.last_message = msg;
+                 }
+             }
+             if (event == Event::Character('+') || event == Event::Character('=')) { // De-Boost (Higher Nice)
+                 if (selected_proc_idx < total) {
+                     std::string msg;
+                     int new_nice = g_state.processes[selected_proc_idx].nice + 1;
+                     if (new_nice > 19) new_nice = 19;
+                     if(set_proc_priority(g_state.processes[selected_proc_idx].pid, new_nice, msg))
+                        g_state.processes[selected_proc_idx].nice = new_nice;
+                     g_state.last_message = msg;
+                 }
+             }
+
+             if (event == Event::Character('k') && !g_state.processes.empty()) { 
+                 kill(g_state.processes[selected_proc_idx].pid, SIGTERM); g_state.last_message = "Killed PID"; 
+             }
         }
+        
         if (tab_index == 3) {
              std::lock_guard<std::mutex> lock(g_mutex);
              int total = g_state.ros_node_names.size();
+             int max_idx = std::max(0, total - 1);
              if (event == Event::ArrowUp && selected_node_idx > 0) { selected_node_idx--; if(selected_node_idx < ros_scroll_start) ros_scroll_start--; }
-             if (event == Event::ArrowDown && selected_node_idx < total-1) { selected_node_idx++; if(selected_node_idx >= ros_scroll_start + VISIBLE_ROS_ROWS) ros_scroll_start++; }
+             if (event == Event::ArrowDown && selected_node_idx < max_idx) { selected_node_idx++; if(selected_node_idx >= ros_scroll_start + VISIBLE_ROS_ROWS) ros_scroll_start++; }
              if (event == Event::Character('k') && !g_state.ros_node_names.empty()) { system(("rosnode kill " + g_state.ros_node_names[selected_node_idx] + " &").c_str()); g_state.last_message = "Killed Node"; }
         }
         return main_container->OnEvent(event);
