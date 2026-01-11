@@ -25,6 +25,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <stdlib.h> // for getloadavg
+#include "toolbox.hpp"
 
 using namespace ftxui;
 
@@ -63,7 +64,44 @@ struct SystemState {
     bool is_root = false; 
 };
 
+struct ToolboxState {
+    // General
+    std::string uptime;
+    std::string kernel;
+    std::string cpu_model;
+    std::string zombie_report;
+    std::string failed_services;
+    std::string cron_jobs;
+
+    // Network
+    std::string public_ip = "Loading...";
+    std::string local_ips;
+    std::string listening_ports;
+    std::string dns_status;
+    std::string net_speed_report = "Press 's' to test speed...";
+
+    // Security
+    std::string firewall_status;
+    std::string sudo_users;
+    std::string failed_ssh_attempts;
+    std::string last_reboots;
+
+    // Disk
+    std::vector<Toolbox::DiskInfo> disks;
+    std::string inode_usage;
+    std::string dir_sizes = "Calculating...";
+    std::string apt_cache_size;
+    std::string large_files_report = "Press 'f' to scan (>100MB)...";
+
+    // DevOps
+    std::string docker_status;
+    std::string usb_devices;
+    std::string ros_env;
+    std::string git_status;
+};
+
 SystemState g_state;
+ToolboxState g_toolbox;
 std::mutex g_mutex;
 bool g_running = true;
 
@@ -310,6 +348,31 @@ void worker_thread() {
     auto last_clean_time = std::chrono::steady_clock::now();
     bool is_root = (geteuid() == 0);
     
+    // Initial fetch of static-ish data
+    {
+        std::string k = Toolbox::get_kernel_info();
+        std::string c = Toolbox::get_cpu_model_name();
+        std::string pub_ip = "Loading...";
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_toolbox.kernel = k;
+        g_toolbox.cpu_model = c;
+        g_toolbox.public_ip = pub_ip; 
+    }
+
+    // Async public IP fetch (slow)
+    std::thread([]{
+        std::string ip = Toolbox::get_public_ip();
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_toolbox.public_ip = ip;
+    }).detach();
+
+    // Async dir size calc (slow)
+    std::thread([]{
+        std::string sizes = Toolbox::get_specific_dir_sizes();
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_toolbox.dir_sizes = sizes;
+    }).detach();
+
     while (g_running) {
         float cpu = get_cpu_usage();
         float mem = get_mem_usage();
@@ -351,6 +414,51 @@ void worker_thread() {
             nodes = g_state.ros_node_names;
             ros_ok = g_state.ros_master_online;
             workspaces = g_state.detected_workspaces;
+        }
+
+        // Toolbox Fast Updates (Every 5 seconds)
+        if (tick % 5 == 0) {
+            // General
+            auto uptime = Toolbox::get_uptime();
+            auto zombies = Toolbox::detect_zombies();
+            auto failed_svc = Toolbox::check_failed_services();
+            
+            // Network
+            auto local_ips = Toolbox::get_local_ips();
+            auto dns = Toolbox::check_dns_resolution();
+            auto ports = Toolbox::check_listening_ports();
+            
+            // Security
+            auto firewall = Toolbox::check_firewall_status();
+            auto reboots = Toolbox::get_last_reboots();
+            auto ssh_fail = Toolbox::count_failed_ssh_logins();
+
+            // Disk
+            auto disks = Toolbox::get_disk_space();
+            auto inodes = Toolbox::get_inode_usage();
+            auto apt_cache = Toolbox::check_apt_cache_size();
+
+            // DevOps
+            auto docker = Toolbox::check_docker_status();
+            auto ros_env = Toolbox::get_ros_env_vars();
+            auto usb = Toolbox::list_usb_devices();
+            
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_toolbox.uptime = uptime;
+            g_toolbox.zombie_report = zombies;
+            g_toolbox.failed_services = failed_svc;
+            g_toolbox.local_ips = local_ips;
+            g_toolbox.dns_status = dns;
+            g_toolbox.listening_ports = ports;
+            g_toolbox.firewall_status = firewall;
+            g_toolbox.last_reboots = reboots;
+            g_toolbox.failed_ssh_attempts = ssh_fail;
+            g_toolbox.disks = disks;
+            g_toolbox.inode_usage = inodes;
+            g_toolbox.apt_cache_size = apt_cache;
+            g_toolbox.docker_status = docker;
+            g_toolbox.ros_env = ros_env;
+            g_toolbox.usb_devices = usb;
         }
 
         {
@@ -541,15 +649,112 @@ int main() {
         return window(text(" ROS Nodes "), vbox(std::move(lines)) | flex);
     });
 
+    // 5. Toolbox
+    int toolbox_tab_idx = 0;
+    std::vector<std::string> toolbox_entries = { "General", "Network", "Security", "Disk", "DevOps" };
+    auto toolbox_menu = Menu(&toolbox_entries, &toolbox_tab_idx, MenuOption::HorizontalAnimated());
+    
+    // 5.1 General
+    auto tb_general = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return vbox(
+            hbox(text("Kernel: ") | bold, text(g_toolbox.kernel)),
+            hbox(text("CPU Model: ") | bold, text(g_toolbox.cpu_model)),
+            hbox(text("Uptime: ") | bold, text(g_toolbox.uptime)),
+            separator(),
+            text("Zombie Processes:") | bold,
+            text(g_toolbox.zombie_report) | color(g_toolbox.zombie_report.find("No") != std::string::npos ? Color::Green : Color::Red),
+            separator(),
+            text("Failed Systemd Services:") | bold,
+            text(g_toolbox.failed_services.empty() ? "None" : g_toolbox.failed_services) | color(Color::Red)
+        );
+    });
+
+    // 5.2 Network
+    auto tb_network = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return vbox(
+            hbox(text("Public IP: ") | bold, text(g_toolbox.public_ip) | color(Color::Cyan)),
+            text("Local IPs:") | bold, text(g_toolbox.local_ips),
+            separator(),
+            hbox(text("DNS (Google): ") | bold, text(g_toolbox.dns_status)),
+            hbox(text("Ping Speed: ") | bold, text(g_toolbox.net_speed_report)),
+            separator(),
+            text("Listening Ports:") | bold,
+            text(g_toolbox.listening_ports) | flex
+        );
+    });
+
+    // 5.3 Security
+    auto tb_security = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return vbox(
+            hbox(text("Firewall: ") | bold, text(g_toolbox.firewall_status)),
+            hbox(text("Failed SSH Attempts: ") | bold, text(g_toolbox.failed_ssh_attempts) | color(Color::Red)),
+            separator(),
+            text("Last Reboots:") | bold, text(g_toolbox.last_reboots),
+            separator(),
+            text("Note: Some security checks require root.") | color(Color::GrayLight)
+        );
+    });
+
+    // 5.4 Disk
+    auto tb_disk = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Elements disk_lines;
+        disk_lines.push_back(hbox(text("FS")|size(WIDTH, EQUAL, 10), text("Size")|size(WIDTH, EQUAL, 8), text("Use%")|size(WIDTH, EQUAL, 6), text("Mount")));
+        for (const auto& d : g_toolbox.disks) {
+            disk_lines.push_back(hbox(text(d.filesystem)|size(WIDTH, EQUAL, 10), text(d.size)|size(WIDTH, EQUAL, 8), text(d.use_percent)|size(WIDTH, EQUAL, 6), text(d.mount)));
+        }
+        return vbox(
+            vbox(std::move(disk_lines)),
+            separator(),
+            hbox(text("Inode Usage (/): ") | bold, text(g_toolbox.inode_usage)),
+            hbox(text("Apt Cache: ") | bold, text(g_toolbox.apt_cache_size)),
+            separator(),
+            text("Directory Sizes:") | bold, text(g_toolbox.dir_sizes),
+            separator(),
+            text("Large Files (>100MB):") | bold, text(g_toolbox.large_files_report)
+        );
+    });
+
+    // 5.5 DevOps
+    auto tb_devops = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return vbox(
+            text("Docker Status:") | bold, text(g_toolbox.docker_status),
+            separator(),
+            text("USB Devices:") | bold, text(g_toolbox.usb_devices),
+            separator(),
+            text("ROS Env:") | bold, text(g_toolbox.ros_env) | color(Color::Green)
+        );
+    });
+
+    auto toolbox_content = Container::Tab({tb_general, tb_network, tb_security, tb_disk, tb_devops}, &toolbox_tab_idx);
+    
+    auto toolbox_container = Container::Vertical({
+        toolbox_menu,
+        toolbox_content
+    });
+
+    auto toolbox_renderer = Renderer(toolbox_container, [&] { 
+        return window(text(" System Toolbox (Extended) "), vbox(
+            toolbox_menu->Render(),
+            separator(),
+            toolbox_content->Render() | flex
+        )); 
+    });
+
+
     // --- Controller ---
     int tab_index = 0;
-    std::vector<std::string> tab_entries = { "Dashboard", "Network", "Processes", "ROS" };
+    std::vector<std::string> tab_entries = { "Dashboard", "Network", "Processes", "ROS", "Toolbox" };
     auto tab_menu = Menu(&tab_entries, &tab_index, MenuOption::HorizontalAnimated());
-    auto tab_container = Container::Tab({dashboard, network_renderer, proc_renderer, ros_renderer}, &tab_index);
+    auto tab_container = Container::Tab({dashboard, network_renderer, proc_renderer, ros_renderer, toolbox_renderer}, &tab_index);
 
     auto main_container = Container::Vertical({
         Container::Horizontal({
-            Renderer([&]{ return text(" ROS-Edge-Commander v0.7 ") | bold | color(Color::Cyan) | center; }),
+            Renderer([&]{ return text(" ROS-Edge-Commander v0.9 ") | bold | color(Color::Cyan) | center; }),
             tab_menu,
             Renderer([&]{ return text(" | 'q' quit ") | color(Color::GrayDark); })
         }) | border,
@@ -584,6 +789,28 @@ int main() {
             if(g_state.mem_threshold > 5) g_state.mem_threshold -= 5;
             g_state.last_message = "Limit set to " + std::to_string(g_state.mem_threshold) + "%";
             return true;
+        }
+
+        // Toolbox Actions
+        if (tab_index == 4) {
+            if (event == Event::Character('f')) {
+                // Find Large Files (Async)
+                std::thread([]{
+                    { std::lock_guard<std::mutex> lock(g_mutex); g_toolbox.large_files_report = "Scanning..."; }
+                    std::string report = Toolbox::find_large_files("/", 100);
+                    { std::lock_guard<std::mutex> lock(g_mutex); g_toolbox.large_files_report = report.empty() ? "None found." : report; }
+                }).detach();
+                return true;
+            }
+            if (event == Event::Character('s')) {
+                // Test Net Speed (Async)
+                std::thread([]{
+                    { std::lock_guard<std::mutex> lock(g_mutex); g_toolbox.net_speed_report = "Testing ping..."; }
+                    std::string report = Toolbox::test_network_speed();
+                    { std::lock_guard<std::mutex> lock(g_mutex); g_toolbox.net_speed_report = report.empty() ? "Timeout." : report; }
+                }).detach();
+                return true;
+            }
         }
 
         // Process Renice Logic

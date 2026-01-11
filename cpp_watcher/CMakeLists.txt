@@ -15,7 +15,7 @@ FetchContent_Declare(ftxui
 FetchContent_MakeAvailable(ftxui)
 
 # 添加主程序
-add_executable(watcher src/main.cpp)
+add_executable(watcher src/main.cpp src/toolbox.cpp)
 
 # 链接库
 target_link_libraries(watcher

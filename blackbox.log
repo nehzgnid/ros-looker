@@ -1,0 +1,12 @@
+[22:16:24] [INFO] Watcher System Started
+[22:16:24] [INFO] Root privileges detected
+[22:30:26] [INFO] Tool Exec: ping -c 3 8.8.8.8
+[22:30:32] [INFO] Tool Exec: hostname -I
+[22:30:42] [INFO] Tool Exec: resolvectl flush-caches
+[22:31:45] [WARN] Sentinel: Abnormal CPU Activity
+[22:41:39] [WARN] Sentinel: Abnormal CPU Activity
+[22:44:07] [WARN] Sentinel: Abnormal CPU Activity
+[22:48:07] [WARN] Sentinel: Abnormal CPU Activity
+[22:49:49] [WARN] Sentinel: Abnormal CPU Activity
+[22:52:07] [WARN] Sentinel: Abnormal CPU Activity
+[22:58:29] [WARN] Sentinel: Abnormal CPU Activity
