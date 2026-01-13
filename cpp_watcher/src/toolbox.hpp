@@ -18,6 +18,8 @@ namespace Toolbox {
     std::string detect_zombies(); // Returns count and list
     std::string check_failed_services(); // systemctl --failed
     std::string list_cron_jobs();
+    std::string get_battery_status(); // /sys/class/power_supply
+    std::string get_sensors_summary(); // lm-sensors or /sys/class/thermal
 
     // --- Category: Network Advanced ---
     std::string get_public_ip(); // curl
@@ -64,6 +66,22 @@ namespace Toolbox {
     std::string list_usb_devices();
     std::string get_ros_env_vars(); // ROS_MASTER_URI, etc.
     std::string check_git_status(const std::string& path);
+
+    // --- Category: AI & Deep Learning ---
+    struct GPUInfo {
+        std::string name = "N/A";
+        std::string util = "0";
+        std::string mem_used = "0";
+        std::string mem_total = "0";
+        std::string temp = "0";
+        std::string power = "0";
+        bool available = false;
+    };
+    GPUInfo get_gpu_status();
+    std::string get_cuda_version();
+    std::string get_python_info(); // Version + Pip packages count
+    std::string check_dl_frameworks(); // Check for torch/tensorflow import ability
+    std::string list_conda_envs();
 
     // --- Legacy/Misc ---
     std::string get_net_connections();

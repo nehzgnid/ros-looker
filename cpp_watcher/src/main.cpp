@@ -1,6 +1,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/dom/table.hpp>
 #include <ftxui/screen/color.hpp>
 #include <ftxui/component/event.hpp>
 
@@ -72,6 +73,8 @@ struct ToolboxState {
     std::string zombie_report;
     std::string failed_services;
     std::string cron_jobs;
+    std::string battery_status;
+    std::string sensors_summary;
 
     // Network
     std::string public_ip = "Loading...";
@@ -98,6 +101,13 @@ struct ToolboxState {
     std::string usb_devices;
     std::string ros_env;
     std::string git_status;
+
+    // AI / DL
+    Toolbox::GPUInfo gpu_info;
+    std::string cuda_version;
+    std::string python_info;
+    std::string dl_frameworks = "Checking...";
+    std::string conda_envs;
 };
 
 SystemState g_state;
@@ -373,6 +383,13 @@ void worker_thread() {
         g_toolbox.dir_sizes = sizes;
     }).detach();
 
+    // Async AI Framework check (slow)
+    std::thread([]{
+        std::string fw = Toolbox::check_dl_frameworks();
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_toolbox.dl_frameworks = fw;
+    }).detach();
+
     while (g_running) {
         float cpu = get_cpu_usage();
         float mem = get_mem_usage();
@@ -422,6 +439,8 @@ void worker_thread() {
             auto uptime = Toolbox::get_uptime();
             auto zombies = Toolbox::detect_zombies();
             auto failed_svc = Toolbox::check_failed_services();
+            auto batt = Toolbox::get_battery_status();
+            auto sens = Toolbox::get_sensors_summary();
             
             // Network
             auto local_ips = Toolbox::get_local_ips();
@@ -442,11 +461,19 @@ void worker_thread() {
             auto docker = Toolbox::check_docker_status();
             auto ros_env = Toolbox::get_ros_env_vars();
             auto usb = Toolbox::list_usb_devices();
+
+            // AI
+            auto gpu = Toolbox::get_gpu_status();
+            auto cuda = Toolbox::get_cuda_version();
+            auto py = Toolbox::get_python_info();
+            auto conda = Toolbox::list_conda_envs();
             
             std::lock_guard<std::mutex> lock(g_mutex);
             g_toolbox.uptime = uptime;
             g_toolbox.zombie_report = zombies;
             g_toolbox.failed_services = failed_svc;
+            g_toolbox.battery_status = batt;
+            g_toolbox.sensors_summary = sens;
             g_toolbox.local_ips = local_ips;
             g_toolbox.dns_status = dns;
             g_toolbox.listening_ports = ports;
@@ -459,6 +486,11 @@ void worker_thread() {
             g_toolbox.docker_status = docker;
             g_toolbox.ros_env = ros_env;
             g_toolbox.usb_devices = usb;
+            
+            g_toolbox.gpu_info = gpu;
+            g_toolbox.cuda_version = cuda;
+            g_toolbox.python_info = py;
+            g_toolbox.conda_envs = conda;
         }
 
         {
@@ -651,37 +683,62 @@ int main() {
 
     // 5. Toolbox
     int toolbox_tab_idx = 0;
-    std::vector<std::string> toolbox_entries = { "General", "Network", "Security", "Disk", "DevOps" };
+    std::vector<std::string> toolbox_entries = { "General", "Network", "Security", "Disk", "DevOps", "AI" };
     auto toolbox_menu = Menu(&toolbox_entries, &toolbox_tab_idx, MenuOption::HorizontalAnimated());
     
     // 5.1 General
     auto tb_general = Renderer([&] {
         std::lock_guard<std::mutex> lock(g_mutex);
+        
+        std::vector<std::vector<std::string>> data = {
+            {"Info", "Value"},
+            {"Kernel", g_toolbox.kernel},
+            {"CPU Model", g_toolbox.cpu_model},
+            {"Uptime", g_toolbox.uptime},
+            {"Battery", g_toolbox.battery_status},
+        };
+        auto t = Table(data);
+        t.SelectAll().Border(LIGHT);
+        t.SelectRow(0).Decorate(bold);
+        t.SelectColumn(0).BorderRight();
+        t.SelectColumn(0).Decorate(bold);
+
         return vbox(
-            hbox(text("Kernel: ") | bold, text(g_toolbox.kernel)),
-            hbox(text("CPU Model: ") | bold, text(g_toolbox.cpu_model)),
-            hbox(text("Uptime: ") | bold, text(g_toolbox.uptime)),
-            separator(),
-            text("Zombie Processes:") | bold,
-            text(g_toolbox.zombie_report) | color(g_toolbox.zombie_report.find("No") != std::string::npos ? Color::Green : Color::Red),
-            separator(),
-            text("Failed Systemd Services:") | bold,
-            text(g_toolbox.failed_services.empty() ? "None" : g_toolbox.failed_services) | color(Color::Red)
+            text("System Info") | bold | color(Color::Cyan),
+            t.Render(),
+            text(""),
+            hbox(
+                vbox(text("Sensors") | bold, text(g_toolbox.sensors_summary) | color(Color::Yellow)) | flex,
+                separator(),
+                vbox(text("Failed Services") | bold, text(g_toolbox.failed_services.empty() ? "None" : g_toolbox.failed_services) | color(Color::Red)) | flex
+            ) | border
         );
     });
 
     // 5.2 Network
     auto tb_network = Renderer([&] {
         std::lock_guard<std::mutex> lock(g_mutex);
+        
+        std::vector<std::vector<std::string>> net_data = {
+            {"Metric", "Status"},
+            {"Public IP", g_toolbox.public_ip},
+            {"DNS (Google)", g_toolbox.dns_status},
+            {"Ping Speed", g_toolbox.net_speed_report},
+        };
+        auto t = Table(net_data);
+        t.SelectAll().Border(LIGHT);
+        t.SelectRow(0).Decorate(bold);
+
         return vbox(
-            hbox(text("Public IP: ") | bold, text(g_toolbox.public_ip) | color(Color::Cyan)),
-            text("Local IPs:") | bold, text(g_toolbox.local_ips),
-            separator(),
-            hbox(text("DNS (Google): ") | bold, text(g_toolbox.dns_status)),
-            hbox(text("Ping Speed: ") | bold, text(g_toolbox.net_speed_report)),
-            separator(),
+            text("Network Status") | bold | color(Color::Cyan),
+            hbox(
+                t.Render(),
+                separator(),
+                vbox(text("Local IPs:") | bold, text(g_toolbox.local_ips)) | flex
+            ),
+            text(""),
             text("Listening Ports:") | bold,
-            text(g_toolbox.listening_ports) | flex
+            text(g_toolbox.listening_ports) | border | color(Color::Green)
         );
     });
 
@@ -689,32 +746,51 @@ int main() {
     auto tb_security = Renderer([&] {
         std::lock_guard<std::mutex> lock(g_mutex);
         return vbox(
-            hbox(text("Firewall: ") | bold, text(g_toolbox.firewall_status)),
-            hbox(text("Failed SSH Attempts: ") | bold, text(g_toolbox.failed_ssh_attempts) | color(Color::Red)),
-            separator(),
-            text("Last Reboots:") | bold, text(g_toolbox.last_reboots),
-            separator(),
-            text("Note: Some security checks require root.") | color(Color::GrayLight)
+            hbox(text("Firewall: ") | bold, text(g_toolbox.firewall_status) | border),
+            text(""),
+            hbox(
+                vbox(text("Failed SSH Attempts")|bold, text(g_toolbox.failed_ssh_attempts)|color(Color::Red)|center) | border | flex,
+                vbox(text("Zombie Processes")|bold, text(g_toolbox.zombie_report)|color(Color::Magenta)|center) | border | flex
+            ),
+            text(""),
+            text("Last Reboots:") | bold, 
+            text(g_toolbox.last_reboots) | border
         );
     });
 
     // 5.4 Disk
     auto tb_disk = Renderer([&] {
         std::lock_guard<std::mutex> lock(g_mutex);
-        Elements disk_lines;
-        disk_lines.push_back(hbox(text("FS")|size(WIDTH, EQUAL, 10), text("Size")|size(WIDTH, EQUAL, 8), text("Use%")|size(WIDTH, EQUAL, 6), text("Mount")));
+        
+        std::vector<std::vector<std::string>> disk_data;
+        disk_data.push_back({"Mount", "Size", "Used", "Avail", "Use%", "FS"});
         for (const auto& d : g_toolbox.disks) {
-            disk_lines.push_back(hbox(text(d.filesystem)|size(WIDTH, EQUAL, 10), text(d.size)|size(WIDTH, EQUAL, 8), text(d.use_percent)|size(WIDTH, EQUAL, 6), text(d.mount)));
+            disk_data.push_back({d.mount, d.size, d.used, d.avail, d.use_percent, d.filesystem});
         }
+        auto t = Table(disk_data);
+        t.SelectAll().Border(LIGHT);
+        t.SelectRow(0).Decorate(bold);
+        
+        for (size_t r = 1; r < disk_data.size(); ++r) {
+             try {
+                std::string s = disk_data[r][4];
+                if (!s.empty() && s.back() == '%') s.pop_back();
+                if (std::stoi(s) > 80) t.SelectRow(r).Decorate(color(Color::Red));
+                else t.SelectRow(r).Decorate(color(Color::Green));
+            } catch(...) {}
+        }
+
         return vbox(
-            vbox(std::move(disk_lines)),
-            separator(),
-            hbox(text("Inode Usage (/): ") | bold, text(g_toolbox.inode_usage)),
-            hbox(text("Apt Cache: ") | bold, text(g_toolbox.apt_cache_size)),
-            separator(),
-            text("Directory Sizes:") | bold, text(g_toolbox.dir_sizes),
-            separator(),
-            text("Large Files (>100MB):") | bold, text(g_toolbox.large_files_report)
+            text("FileSystems") | bold | color(Color::Cyan),
+            t.Render(),
+            text(""),
+            hbox(
+                vbox(text("Inode Usage (/): ") | bold, text(g_toolbox.inode_usage)),
+                separator(),
+                vbox(text("Apt Cache: ") | bold, text(g_toolbox.apt_cache_size))
+            ) | border,
+            text("Large Files (>100MB):") | bold, 
+            text(g_toolbox.large_files_report) | color(Color::GrayLight)
         );
     });
 
@@ -722,15 +798,55 @@ int main() {
     auto tb_devops = Renderer([&] {
         std::lock_guard<std::mutex> lock(g_mutex);
         return vbox(
-            text("Docker Status:") | bold, text(g_toolbox.docker_status),
-            separator(),
-            text("USB Devices:") | bold, text(g_toolbox.usb_devices),
-            separator(),
-            text("ROS Env:") | bold, text(g_toolbox.ros_env) | color(Color::Green)
+            hbox(
+                vbox(text("Docker Containers")|bold, text(g_toolbox.docker_status)|color(Color::Blue)|center) | border | flex,
+                vbox(text("USB Devices")|bold, text(g_toolbox.usb_devices)) | border | flex
+            ),
+            text(""),
+            text("ROS Environment Variables") | bold | color(Color::Green),
+            text(g_toolbox.ros_env) | border
         );
     });
 
-    auto toolbox_content = Container::Tab({tb_general, tb_network, tb_security, tb_disk, tb_devops}, &toolbox_tab_idx);
+    // 5.6 AI / Deep Learning
+    auto tb_ai = Renderer([&] {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        
+        // GPU Table
+        Element gpu_table_elem;
+        if (g_toolbox.gpu_info.available) {
+            auto& g = g_toolbox.gpu_info;
+            std::vector<std::vector<std::string>> gpu_data = {
+                {"Name", g.name},
+                {"Util", g.util + "%"},
+                {"Memory", g.mem_used + " / " + g.mem_total + " MiB"},
+                {"Temp", g.temp + " C"},
+                {"Power", g.power + " W"}
+            };
+            auto t = Table(gpu_data);
+            t.SelectAll().Border(LIGHT);
+            gpu_table_elem = t.Render();
+        } else {
+            gpu_table_elem = text("No NVIDIA GPU detected") | color(Color::Red) | border;
+        }
+
+        return vbox(
+            text("Hardware Accelerator") | bold | color(Color::Cyan),
+            gpu_table_elem,
+            text(""),
+            text("Software Stack") | bold,
+            hbox(
+                vbox(text("CUDA")|bold, text(g_toolbox.cuda_version)) | border | flex,
+                vbox(text("Python")|bold, text(g_toolbox.python_info)) | border | flex
+            ),
+            hbox(
+                vbox(text("Frameworks")|bold, text(g_toolbox.dl_frameworks)) | border | flex,
+                vbox(text("Conda Envs")|bold, text(g_toolbox.conda_envs)) | border | flex
+            )
+        );
+    });
+
+    auto toolbox_content = Container::Tab({tb_general, tb_network, tb_security, tb_disk, tb_devops, tb_ai}, &toolbox_tab_idx);
     
     auto toolbox_container = Container::Vertical({
         toolbox_menu,
